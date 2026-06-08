@@ -1,0 +1,10 @@
+{
+  "_comment": "Per-product JDK map. Lookup order: [product][exact-version] -> [product][major] -> [product].default -> top-level default. Replace with your real matrix; values below are SAMPLES.",
+
+  "wso2am":  { "4.7.0": 11, "4": 17, "default": 17 },
+  "wso2is":  { "7": 21, "6": 11, "default": 11 },
+  "wso2mi":  { "4": 17, "default": 17 },
+  "wso2ei":  { "default": 11 },
+
+  "default": 17
+}
