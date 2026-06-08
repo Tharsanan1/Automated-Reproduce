@@ -1,23 +1,47 @@
 name: claude-repro
 
-# Reproduce a customer-reported bug automatically when a triage lead labels an issue.
+# Reproduce a customer-reported bug automatically.
 #
-# Flow:
-#   labeled event -> parse config labels -> set up JDK -> fetch reproduce skill
-#   -> download product pack from S3 -> extract + update product -> run Claude
-#   agent (model + budget from labels) to reproduce and comment.
+# Two ways to launch a run:
 #
-# IMPORTANT: the kickoff label `needs-repro` must be applied LAST. Apply the
-# config labels (<product>-<version>, mode-*, max-cost-*, update-level-*, update-stage-*)
-# first, then add `needs-repro` to launch — the run reads the full label set,
-# but only fires on the `needs-repro` event.
+#   1. Label path  — a lead sets the issue identity label
+#      (<product>-<version>) plus any reproduce-* run-config labels, then adds
+#      `needs-repro` LAST to fire. The reproduce-* labels stay on the issue so
+#      you can see, at any time, what config is in action.
+#
+#   2. workflow_dispatch — run the same issue against different settings without
+#      relabeling. Useful for trying one issue against the customer's update
+#      level, then live, then staging. Pass issue_number plus any run params to
+#      override; blank inputs fall back to the issue's labels / defaults.
+#
+# Why the split: <product>-<version> is issue *identity* (stable, selectable).
+# Model, budget, update level and update stage are per-RUN parameters — they
+# describe one attempt, not the bug — so they live behind the reproduce- prefix
+# (label path) or as dispatch inputs, and can change run to run.
 
 on:
   issues:
     types: [labeled]
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: "Issue number to reproduce"
+        required: true
+      model:
+        description: "Model, e.g. opus-4-8. Blank = issue's reproduce-mode-* label / default sonnet."
+        required: false
+      cost:
+        description: "Per-run USD budget. Blank = issue's reproduce-max-cost-* label / default 5."
+        required: false
+      update_level:
+        description: "Pin a specific update level number. Blank = issue label / latest for the stage."
+        required: false
+      update_state:
+        description: "Update stage: staging | uat | live. Blank = issue label / live."
+        required: false
 
 # Least privilege:
-#   issues: write  -> post the comment and re-label
+#   issues: write  -> read labels, post the comment, re-label
 #   contents: read -> read the repo (and the .github scripts)
 #   id-token: write-> OIDC assume-role for S3 access
 permissions:
@@ -27,47 +51,87 @@ permissions:
 
 jobs:
   reproduce:
-    if: github.event.label.name == 'needs-repro'
+    # Fire on a manual dispatch, or only when the added label is `needs-repro`.
+    if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'needs-repro'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    # One in-flight run per issue; a second labeling queues instead of racing.
+    # One in-flight run per issue; a second launch queues instead of racing.
     concurrency:
-      group: repro-${{ github.event.issue.number }}
+      group: repro-${{ github.event.issue.number || github.event.inputs.issue_number }}
       cancel-in-progress: false
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # 1) Read every label on the issue into config outputs.
-      - name: Parse labels
+      # 0) Which issue are we reproducing? (payload for the label path, input for dispatch)
+      - name: Resolve issue number
+        id: issue
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            n="${{ github.event.inputs.issue_number }}"
+          else
+            n="${{ github.event.issue.number }}"
+          fi
+          [[ -n "$n" ]] || { echo "::error::could not resolve an issue number."; exit 1; }
+          echo "number=$n" >> "$GITHUB_OUTPUT"
+
+      # 1) Resolve run config. Single code path for both triggers:
+      #    identity (product/version) always comes from the issue's labels;
+      #    run params default -> reproduce-* labels -> overridden by dispatch inputs.
+      - name: Parse config
         id: cfg
         env:
-          LABELS: ${{ toJSON(github.event.issue.labels.*.name) }}
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ steps.issue.outputs.number }}
+          # dispatch overrides — empty string on the label path
+          IN_MODEL: ${{ github.event.inputs.model }}
+          IN_COST: ${{ github.event.inputs.cost }}
+          IN_LEVEL: ${{ github.event.inputs.update_level }}
+          IN_STATE: ${{ github.event.inputs.update_state }}
+          # account-policy ceiling — a label/input can never raise spend past this
+          BUDGET_CEILING: ${{ vars.REPRO_MAX_BUDGET_CEILING || '25' }}
         run: |
+          set -euo pipefail
+
           model="claude-sonnet-4-6"   # default model (latest Sonnet)
           cost="5"                    # default per-run USD budget
           product=""                  # product name    (from <product>-<version> label)
           version=""                  # product version (from <product>-<version> label)
           level=""                    # specific update level (optional)
-          state="live"                # update lifecycle channel (default live)
+          state="live"                # update lifecycle stage (default live)
+
+          # Read the issue's current labels (works for both triggers).
+          labels="$(gh api "repos/${{ github.repository }}/issues/${ISSUE}/labels" --jq '.[].name')"
 
           while read -r l; do
+            [[ -z "$l" ]] && continue
             case "$l" in
-              mode-*)         m="${l#mode-}"; [[ "$m" == claude-* ]] && model="$m" || model="claude-$m" ;;
-              max-cost-*)     cost="${l#max-cost-}" ;;
-              update-level-*) level="${l#update-level-}" ;;
-              update-stage-*) state="${l#update-stage-}" ;;
-              needs-repro)    ;;  # the trigger label itself — nothing to parse
+              # Per-run config — namespaced so the active settings are obvious on the issue.
+              reproduce-mode-*)         m="${l#reproduce-mode-}"; [[ "$m" == claude-* ]] && model="$m" || model="claude-$m" ;;
+              reproduce-max-cost-*)     cost="${l#reproduce-max-cost-}" ;;
+              reproduce-update-level-*) level="${l#reproduce-update-level-}" ;;
+              reproduce-update-stage-*) state="${l#reproduce-update-stage-}" ;;
+              # Issue identity — bare, selectable. Handles hyphenated product
+              # names like wso2am-analytics-3.2.0. Broaden glob for non-wso2.
               wso2*)
-                # <product>-<version>, e.g. wso2am-4.7.0  (also handles
-                # hyphenated product names like wso2am-analytics-3.2.0).
-                # Broaden this glob if you have non-wso2 products.
                 if [[ "$l" =~ ^(.+)-([0-9][0-9.]*)$ ]]; then
                   product="${BASH_REMATCH[1]}"; version="${BASH_REMATCH[2]}"
                 fi ;;
             esac
-          done < <(printf '%s' "$LABELS" | jq -r '.[]')
+          done <<< "$labels"
+
+          # workflow_dispatch inputs override the labels when provided.
+          [[ -n "$IN_MODEL" ]] && { [[ "$IN_MODEL" == claude-* ]] && model="$IN_MODEL" || model="claude-$IN_MODEL"; }
+          [[ -n "$IN_COST"  ]] && cost="$IN_COST"
+          [[ -n "$IN_LEVEL" ]] && level="$IN_LEVEL"
+          [[ -n "$IN_STATE" ]] && state="$IN_STATE"
+
+          # Clamp the per-run budget to the account-policy ceiling.
+          if awk "BEGIN{exit !($cost+0 > $BUDGET_CEILING+0)}"; then
+            echo "::warning::requested budget \$$cost exceeds ceiling \$$BUDGET_CEILING — clamping to \$$BUDGET_CEILING."
+            cost="$BUDGET_CEILING"
+          fi
 
           # <product> + <version> -> JDK. Lookup order: exact version, then major,
           # then the product's default, then the global default.
@@ -90,14 +154,37 @@ jobs:
             echo "java=$java"
           } >> "$GITHUB_OUTPUT"
 
-          echo "Resolved -> product=$product version=$version model=$model budget=\$$cost java=$java level=${level:-<latest>} state=$state"
+          echo "Resolved -> issue=#$ISSUE product=$product version=$version model=$model budget=\$$cost java=$java level=${level:-<latest>} state=$state"
 
       # Bail early with a clear message if no product label is present.
       - name: Require a product label
         if: steps.cfg.outputs.product == ''
         run: |
-          echo "::error::No '<product>-<version>' label (e.g. wso2am-4.7.0) on this issue — cannot choose the pack or JDK."
+          echo "::error::No '<product>-<version>' label (e.g. wso2am-4.7.0) on issue #${{ steps.issue.outputs.number }} — cannot choose the pack or JDK."
           exit 1
+
+      # 1b) Acknowledge on the issue that a run has started, echoing the RESOLVED
+      #     config — so the lead gets instant confirmation and can immediately spot
+      #     a clamped budget or defaults picked up from a label-ordering mistake.
+      - name: Acknowledge start
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ steps.issue.outputs.number }}
+        run: |
+          gh issue comment "$ISSUE" --body "$(cat <<EOF
+          🔄 **Reproduction started** — [view run](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})
+
+          | setting | value |
+          | --- | --- |
+          | product | \`${{ steps.cfg.outputs.product }} ${{ steps.cfg.outputs.version }}\` |
+          | model | \`${{ steps.cfg.outputs.model }}\` |
+          | budget | \`\$${{ steps.cfg.outputs.cost }}\` |
+          | update | stage \`${{ steps.cfg.outputs.state }}\`, level \`${{ steps.cfg.outputs.level || 'latest' }}\` |
+          | java | \`${{ steps.cfg.outputs.java }}\` |
+
+          The outcome will be posted here when the run finishes.
+          EOF
+          )"
 
       # 2) Install the JDK this product version needs.
       - name: Set up Java
@@ -107,9 +194,10 @@ jobs:
           java-version: ${{ steps.cfg.outputs.java }}
           cache: maven        # switch to 'gradle' if your repro builds with Gradle
 
-      # 3) Pull the reproduce skill into the workspace as a plain project skill.
-      #    (It is discovered from .claude/skills/ at session start.)
-      - name: Fetch reproduce skill
+      # 3) Pull the reproduce skill (and project CLAUDE.md) into the workspace.
+      #    The skill is discovered from .claude/skills/ at session start; CLAUDE.md
+      #    at the workspace root is loaded as project memory.
+      - name: Fetch reproduce skill and CLAUDE.md
         env:
           SKILLS_TOKEN: ${{ secrets.SKILLS_REPO_TOKEN }}
         run: |
@@ -119,6 +207,13 @@ jobs:
             "https://x-access-token:${SKILLS_TOKEN}@github.com/${{ vars.SKILLS_REPO }}.git" "$tmp"
           cp -r "$tmp/reproduce" .claude/skills/reproduce
           test -f .claude/skills/reproduce/SKILL.md
+          # DRAFT: bring the project CLAUDE.md across if the skills repo ships one.
+          if [[ -f "$tmp/CLAUDE.md" ]]; then
+            cp "$tmp/CLAUDE.md" ./CLAUDE.md
+            echo "Fetched CLAUDE.md into workspace root."
+          else
+            echo "::warning::no CLAUDE.md in skills repo root — skipping (draft)."
+          fi
 
       # 4) OIDC credentials to read the product pack from S3.
       - name: Configure AWS credentials
@@ -146,7 +241,7 @@ jobs:
           chmod +x .github/scripts/prepare-product.sh
           .github/scripts/prepare-product.sh ./pack.zip
 
-      # 7) Run the agent: reproduce the bug and comment. Model + budget per label.
+      # 7) Run the agent: reproduce the bug and comment. Model + budget per run.
       - name: Reproduce with Claude
         uses: anthropics/claude-code-action@v1
         with:
@@ -165,17 +260,62 @@ jobs:
             Java ${{ steps.cfg.outputs.java }} is installed and on PATH.
 
             Use the `reproduce` skill to attempt a reproduction of issue
-            #${{ github.event.issue.number }}. Run the skill's bundled steps and
+            #${{ steps.issue.outputs.number }}. Run the skill's bundled steps and
             scripts; do NOT invent an ad-hoc reproduction procedure.
 
-            When finished, post exactly ONE comment on the issue containing:
-              - Outcome: reproduced / not reproduced / blocked
-              - Environment: ${{ steps.cfg.outputs.product }} ${{ steps.cfg.outputs.version }},
-                update state '${{ steps.cfg.outputs.state }}', update level
-                '${{ steps.cfg.outputs.level }}', Java ${{ steps.cfg.outputs.java }}
-              - The exact steps you ran
-              - Key logs / errors (trimmed) and where the full logs can be found
-              - A short link back to this workflow run
+            When finished, do TWO things:
 
-            Finally set the label 'repro-confirmed' (if reproduced) or
-            'repro-failed' (otherwise), and remove the 'needs-repro' label.
+            1. Write your verdict to the file `verdict.txt` in the current
+               directory as EXACTLY one of these words, nothing else:
+                 reproduced | not-reproduced | blocked
+               (The workflow reads this file to label the issue — do NOT set or
+               remove any labels yourself.)
+
+            2. Post exactly ONE comment on issue
+               #${{ steps.issue.outputs.number }} (use `gh issue comment`) containing:
+                 - Outcome: reproduced / not reproduced / blocked
+                 - Environment: ${{ steps.cfg.outputs.product }} ${{ steps.cfg.outputs.version }},
+                   update state '${{ steps.cfg.outputs.state }}', update level
+                   '${{ steps.cfg.outputs.level }}', Java ${{ steps.cfg.outputs.java }}
+                 - The exact steps you ran
+                 - Key logs / errors (trimmed) and where the full logs can be found
+                 - A short link back to this workflow run
+
+      # 8) Deterministic relabeling. The AGENT decides the verdict (verdict.txt);
+      #    the WORKFLOW does the bookkeeping, so labels are set identically every
+      #    run and can never be mistyped or forgotten by the model. Runs only on a
+      #    successful agent step. A missing/unknown verdict fails LOUD (exit 1) so
+      #    it routes to the failure comment below rather than mislabeling silently.
+      - name: Apply verdict labels
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ steps.issue.outputs.number }}
+        run: |
+          set -euo pipefail
+          verdict="$(tr -d '[:space:]' < verdict.txt 2>/dev/null | tr '[:upper:]' '[:lower:]' || true)"
+          echo "Agent verdict: '${verdict:-<none>}'"
+          case "$verdict" in
+            reproduced)      add="repro-confirmed" ;;
+            not-reproduced)  add="repro-failed" ;;
+            blocked)         add="repro-failed" ;;
+            *)
+              echo "::error::missing or unrecognized verdict ('${verdict:-<none>}') — expected reproduced|not-reproduced|blocked. Leaving 'needs-repro' in place."
+              exit 1 ;;
+          esac
+          gh issue edit "$ISSUE" --add-label "$add"
+          # Best-effort: 'needs-repro' may not be present (e.g. dispatch path).
+          gh issue edit "$ISSUE" --remove-label "needs-repro" || true
+          echo "Labeled issue #$ISSUE with '$add'; cleared 'needs-repro' if present."
+
+      # 9) If ANY step above failed, say so on the issue. `if: failure()` is what
+      #    makes this run on a broken pipeline (every other step is skipped). This
+      #    closes the "silent issue" gap and makes clear a pipeline error is NOT a
+      #    repro verdict. Guarded on having an issue number to comment on.
+      - name: Report pipeline failure
+        if: failure() && steps.issue.outputs.number != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE: ${{ steps.issue.outputs.number }}
+        run: |
+          gh issue comment "$ISSUE" --body "⚠️ **Reproduction run failed before completing.** This is a pipeline error, *not* a repro verdict — the bug was neither confirmed nor ruled out. [View logs](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
